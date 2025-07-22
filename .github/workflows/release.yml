@@ -1,0 +1,180 @@
+name: Auto Release on Push to Master
+on:
+  push:
+    branches:
+      - master
+      - main
+  
+  workflow_dispatch:
+    inputs:
+      target-environment:
+        description: "Target environment for the release"
+        required: true
+        type: string
+        default: "qa"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: |
+          git fetch --tags --force
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION_FILE="VERSION"  
+          
+          # Set target environment (default to qa for push events)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_ENV="${{ inputs.target-environment }}"
+          else
+            # Default environment for push events - you can change this
+            TARGET_ENV="qa"
+          fi
+
+          # Map target-environment to release tag prefix
+          if [ "$TARGET_ENV" = "sit" ]; then
+            TAG_PREFIX="qa-"
+          elif [ "$TARGET_ENV" = "qa" ]; then
+            TAG_PREFIX="qa-"
+          elif [ "$TARGET_ENV" = "prod" ]; then
+            TAG_PREFIX="prod-"
+          else
+            TAG_PREFIX="${TARGET_ENV}-"
+          fi
+
+          # Debug: Check if target environment is provided
+          if [ -z "$TARGET_ENV" ]; then
+            echo "Error: target-environment is not provided or is empty!"
+            exit 1
+          fi
+
+          # Get current branch and commit info
+          CURRENT_BRANCH="${{ github.ref_name }}"
+          COMMIT_SHA="${{ github.sha }}"
+          
+          echo "Target environment: $TARGET_ENV"
+          echo "Tag prefix: $TAG_PREFIX"
+          echo "Current branch: $CURRENT_BRANCH"
+          echo "Current commit: $COMMIT_SHA"
+
+          # Function to increment version smartly
+          increment_version() {
+            local version=$1
+            IFS='.' read -ra PARTS <<< "$version"
+            local MAJOR=${PARTS[0]:-0}
+            local MINOR=${PARTS[1]:-0}
+            local PATCH=${PARTS[2]:-0}
+            
+            # If patch reaches 9, increment minor and reset patch to 0
+            if [ $PATCH -ge 9 ]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+            else
+              PATCH=$((PATCH + 1))
+            fi
+            
+            echo "$MAJOR.$MINOR.$PATCH"
+          }
+
+          # Check if version file exists and was modified in the last commit
+          if git diff --name-only HEAD~1 HEAD | grep -q "^$VERSION_FILE$" && [ -f "$VERSION_FILE" ]; then
+            echo "Version file was updated in the last commit"
+            FILE_VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+            
+            # Remove 'v' prefix if present
+            if [[ "$FILE_VERSION" =~ ^v ]]; then
+              FILE_VERSION=${FILE_VERSION#v}
+            fi
+            
+            NEW_VERSION="$TAG_PREFIX"v$FILE_VERSION
+            echo "Using version from file: $NEW_VERSION"
+            
+            # Check if tag already exists
+            if git tag -l | grep -q "^$NEW_VERSION$"; then
+              echo "Error: Tag '$NEW_VERSION' already exists!"
+              exit 1
+            fi
+          else
+            echo "Version file not found or not updated, using incremental versioning"
+            
+            # Get latest tag for this environment
+            LATEST=$(git tag --list "$TAG_PREFIX*" | sort -V | tail -n1)
+            if [ -z "$LATEST" ]; then
+              LATEST="${TAG_PREFIX}v0.0.0"
+            fi
+            
+            echo "Latest tag for $TAG_PREFIX: $LATEST"
+            VERSION=${LATEST#$TAG_PREFIX}
+            VERSION=${VERSION#v}
+            NEW_VERSION_NUM=$(increment_version "$VERSION")
+            NEW_VERSION="$TAG_PREFIX"v$NEW_VERSION_NUM
+            echo "Incremental version: $NEW_VERSION"
+            
+            # Check if tag already exists
+            if git tag -l | grep -q "^$NEW_VERSION$"; then
+              echo "Error: Tag '$NEW_VERSION' already exists!"
+              exit 1
+            fi
+          fi
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create tag on current commit
+          git tag "$NEW_VERSION" $COMMIT_SHA
+          git push origin "$NEW_VERSION"
+
+          # Validate version format
+          if [[ ! "$NEW_VERSION" =~ ^[a-zA-Z0-9-]+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid version format '$NEW_VERSION'. Expected format: env-v1.2.3"
+            exit 1
+          fi
+
+          echo "Final version to release: $NEW_VERSION"
+
+          # Create JSON payload for GitHub release
+          RELEASE_DATA=$(cat <<EOF
+{
+  "tag_name": "$NEW_VERSION",
+  "target_commitish": "$COMMIT_SHA",
+  "name": "Release $NEW_VERSION",
+  "body": "Automated release for $TARGET_ENV environment\\n\\nCommit: $COMMIT_SHA\\nBranch: $CURRENT_BRANCH",
+  "draft": false,
+  "prerelease": false,
+  "make_latest": "true"
+}
+EOF
+)
+
+          # Create GitHub release
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -d "$RELEASE_DATA")
+
+          # Check if release was created successfully
+          if echo "$RESPONSE" | grep -q '"id"'; then
+            echo "Created GitHub release: $NEW_VERSION"
+            echo "Release created successfully for $TARGET_ENV environment with tag: $NEW_VERSION"
+            
+            # Extract release URL from response
+            RELEASE_URL=$(echo "$RESPONSE" | grep -o '"html_url":"[^"]*' | cut -d'"' -f4)
+            echo "Release URL: $RELEASE_URL"
+          else
+            echo "Error creating release:"
+            echo "$RESPONSE"
+            exit 1
+          fi
